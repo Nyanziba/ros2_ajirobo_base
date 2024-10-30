@@ -4,9 +4,11 @@
 import os
 import time
 import rclpy
+import math
 from rclpy.node        import Node
 from sensor_msgs.msg   import Joy, JointState, Imu, BatteryState, MagneticField
-from geometry_msgs.msg import Twist
+from geometry_msgs.msg import Twist, Quaternion
+from nav_msgs.msg      import Odometry 
 from .ddsm115 import DDSM115, DDSM115_STATUS
 
 
@@ -37,7 +39,7 @@ class ros2_ajirobo_base(Node):
         #self._pub_state_imu      = self.create_publisher( Imu,           'states/imu',          10 )
         #self._pub_state_mag      = self.create_publisher( MagneticField, 'states/mag',          10 )
         #self._pub_state_battery  = self.create_publisher( BatteryState,  'states/batteryState', 10 )
-
+        self._pub_state_odom      = self.create_publisher( Odometry,      'states/odom',         10 ) 
         # subscriber
         self._sub_controller_cmdvel = self.create_subscription( Twist, '/cmd_vel', self._callback_cmdvel, 10 )
 
@@ -59,6 +61,16 @@ class ros2_ajirobo_base(Node):
         self._l_stat = DDSM115_STATUS( id=self._left_id,  current=0.0, velocity=0.0, position=0.0, error=0.0 )
         self._r_stat = DDSM115_STATUS( id=self._right_id, current=0.0, velocity=0.0, position=0.0, error=0.0 )
 
+        # 位置と角度の初期化
+        self._x = 0.0
+        self._y = 0.0
+        self._theta = 0.0
+
+        # 前回の時間
+        self._last_time = self.get_clock().now()
+
+        # 定期的にオドメトリを更新
+        self._timer = self.create_timer(0.1, self.update_odometry)  # 0.1秒間隔
 
     # destructor
     def __del__(self):
@@ -103,7 +115,7 @@ class ros2_ajirobo_base(Node):
         _js = JointState()
         # header
         _js.header.seq      = self._seq
-        _js.header.stamp    = rospy.Time.Now()
+        _js.header.stamp    = rclpy.Time.Now()
         _js.header.frame_id = 'ajirobo'
         # state
         _js.name     = [ 'leftWheel', 'rightWheel' ]
@@ -184,6 +196,60 @@ class ros2_ajirobo_base(Node):
         # publish
         self._pub_state_battery.publish(_bat)
 
+# オドメトリを更新する関数
+    def update_odometry(self):
+        # 現在の時間を取得
+        current_time = self.get_clock().now()
+        dt = (current_time - self._last_time).nanoseconds * 1e-9  # 秒に変換
+        self._last_time = current_time
+
+        # 左右のモーターの速度
+        left_velocity = self._l_stat.velocity  # 左のモーター速度 (RPM)
+        right_velocity = self._r_stat.velocity  # 右のモーター速度 (RPM)
+
+        # RPMをm/sに変換 (wheel_radiusを考慮)
+        left_velocity_mps = (left_velocity * 2 * math.pi * self._wheel_radius) / 60
+        right_velocity_mps = (right_velocity * 2 * math.pi * self._wheel_radius) / 60
+
+        # 両輪の速度の平均で直線速度を算出
+        vx = (left_velocity_mps + right_velocity_mps) / 2.0
+        # 両輪の速度差で角速度を算出
+        vtheta = (right_velocity_mps - left_velocity_mps) / self._wheel_tread
+
+        # オドメトリの更新
+        self._x += vx * math.cos(self._theta) * dt
+        self._y += vx * math.sin(self._theta) * dt
+        self._theta += vtheta * dt
+
+        # オドメトリメッセージの作成
+        odom_msg = Odometry()
+        odom_msg.header.stamp = current_time.to_msg()
+        odom_msg.header.frame_id = 'odom'
+        odom_msg.child_frame_id = 'base_link'
+
+        # 位置情報
+        odom_msg.pose.pose.position.x = self._x
+        odom_msg.pose.pose.position.y = self._y
+        odom_msg.pose.pose.position.z = 0.0
+
+        # 角度をクォータニオンに変換
+        odom_quat = self.create_quaternion_from_yaw(self._theta)
+        odom_msg.pose.pose.orientation = odom_quat
+
+        # 速度情報
+        odom_msg.twist.twist.linear.x = vx
+        odom_msg.twist.twist.linear.y = 0.0
+        odom_msg.twist.twist.angular.z = vtheta
+
+        # パブリッシュ
+        self._pub_state_odom.publish(odom_msg)
+
+    # 角度をクォータニオンに変換
+    def create_quaternion_from_yaw(self, yaw):
+        q = Quaternion()
+        q.z = math.sin(yaw / 2.0)
+        q.w = math.cos(yaw / 2.0)
+        return q
 
 
 
